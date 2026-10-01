@@ -1,0 +1,11 @@
+# hasil compile - jangan di-commit
+parkir
+parkir.exe
+*.dSYM/
+*.o
+
+# database - ini data milik user, jangan di-commit
+*.db
+
+# file sampah
+.DS_Store
