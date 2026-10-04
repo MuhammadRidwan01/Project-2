@@ -1,9 +1,9 @@
 /*
  * ======================================================================
- *  SISTEM PARKIR KAMPUS 
+ *  SISTEM PARKIR KAMPUS  (tanpa database - semua data pakai variabel)
  * ======================================================================
  *  Cara compile:
- *      clang -std=c99 -Wall -Wextra parkir.c -o parkir -lsqlite3
+ *      clang -std=c99 -Wall -Wextra parkir.c -o parkir
  *      ./parkir
  * ======================================================================
  */
@@ -11,27 +11,43 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
-#include <sqlite3.h>
 #include <time.h>
 
 #define SLOT_MOTOR  4
 #define SLOT_MOBIL  8
 #define TOTAL_SLOT  (SLOT_MOTOR + SLOT_MOBIL)
-#define NAMA_DB     "parkir.db"
 
 enum { MOTOR = 0, MOBIL = 1 };
 
-/* Global */
-sqlite3 *db;
-long offsetDetik = 0;
+/* ================================================================
+ *  VARIABEL GLOBAL (pengganti database)
+ * ================================================================ */
 
-time_t waktuSekarang(void) {
-    return time(NULL) + offsetDetik;
+/* Kendaraan yang sedang parkir. Indeks = nomor slot. */
+char platParkir[TOTAL_SLOT][16];   /* plat di slot itu, "" = kosong */
+int  jenisParkir[TOTAL_SLOT];      /* 0 = motor, 1 = mobil         */
+long menitMasukParkir[TOTAL_SLOT]; /* kapan masuk (jumlah menit)    */
+
+/* Riwayat transaksi. Indeks = nomor transaksi. */
+char platRiwayat[50][16];
+int  jenisRiwayat[50];
+int  durasiRiwayat[50];           /* durasi dalam menit */
+int  bayarRiwayat[50];
+int  jumlahRiwayat = 0;
+
+/* Total uang dari semua transaksi */
+long totalPendapatan = 0;
+
+/* Penambahan waktu untuk simulasi (menit) */
+long offsetMenit = 0;
+
+/* Waktu sekarang, dalam menit sejak 1 Januari 1970 */
+long menitSekarang(void) {
+    return (long)(time(NULL) / 60) + offsetMenit;
 }
 
 /* ================================================================
- *  1. HELPER INPUT & TAMPILAN SEDERHANA
+ *  1. HELPER
  * ================================================================ */
 
 void input(const char *prompt, char *buf, int size) {
@@ -49,16 +65,16 @@ int inputAngka(const char *prompt) {
     return atoi(buf);
 }
 
-void rapikanPlat(char *plat) {
-    for (int i = 0; plat[i]; i++)
-        plat[i] = toupper((unsigned char)plat[i]);
+/* Ubah jumlah menit menjadi teks tanggal/jam */
+void tampilWaktu(long menit, char *out) {
+    time_t detik = (time_t)menit * 60;
+    strftime(out, 20, "%d/%m %H:%M:%S", localtime(&detik));
 }
 
-void fmtWaktu(time_t t, char *out) {
-    if (t < 100000000)
-        sprintf(out, "%02d:%02d", (int)(t / 60), (int)(t % 60));
-    else
-        strftime(out, 20, "%d/%m %H:%M:%S", localtime(&t));
+/* Tampilkan nama jenis kendaraan */
+void namaJenis(int jenis, char *out) {
+    if (jenis == MOBIL) strcpy(out, "Mobil");
+    else               strcpy(out, "Motor");
 }
 
 void jeda(void) {
@@ -72,91 +88,117 @@ void jeda(void) {
  * ================================================================ */
 
 int hitungTarif(int jenis, int menit) {
-    int perJam   = (jenis == MOBIL) ? 5000 : 2000;
-    int maksHari = (jenis == MOBIL) ? 50000 : 20000;
+    /* Tarif per jam dan batas maksimum per hari */
+    int perJam, maksSehari;
+    if (jenis == MOBIL) {
+        perJam     = 5000;
+        maksSehari = 50000;
+    } else {
+        perJam     = 2000;
+        maksSehari = 20000;
+    }
 
-    int totalJam = (menit + 59) / 60;
-    if (totalJam < 1) totalJam = 1;
+    /* Ubah menit menjadi jam, sisa menit dihitung jadi 1 jam penuh */
+    int jam = menit / 60;
+    if (menit % 60 > 0) jam = jam + 1;
 
-    int hari      = totalJam / 24;
-    int sisaJam   = totalJam % 24;
-    int biayaSisa = sisaJam * perJam;
-    if (biayaSisa > maksHari) biayaSisa = maksHari;
+    /* Minimal 1 jam */
+    if (jam < 1) jam = 1;
 
-    return (hari * maksHari) + biayaSisa;
+    /* Pisahkan jumlah hari lengkap dan sisa jam */
+    int hari      = jam / 24;
+    int sisaJam   = jam % 24;
+
+    /* Biaya = (hari x batas harian) + (sisa jam x tarif per jam) */
+    int biayaHari  = hari * maksSehari;
+    int biayaSisa  = sisaJam * perJam;
+
+    /* Sisa jam tidak boleh melebihi batas satu hari */
+    if (biayaSisa > maksSehari) biayaSisa = maksSehari;
+
+    return biayaHari + biayaSisa;
 }
 
 /* ================================================================
- *  3. OPERASI DATABASE SQLITE
+ *  3. FUNGSI DATA (cukup array, tanpa query)
  * ================================================================ */
 
-void dbExec(const char *sql) {
-    sqlite3_exec(db, sql, NULL, NULL, NULL);
+/* Slot kosong berarti plat di slot itu kosong string */
+int slotKosong(int s) {
+    if (platParkir[s][0] == 0) return 1;
+    return 0;
 }
 
-long dbAngka(const char *sql, long defVal) {
-    char **hasil;
-    int baris, kolom;
-    long val = defVal;
-    if (sqlite3_get_table(db, sql, &hasil, &baris, &kolom, NULL) == SQLITE_OK) {
-        if (baris > 0 && hasil[kolom]) val = atol(hasil[kolom]);
-        sqlite3_free_table(hasil);
-    }
-    return val;
-}
-
-void dbBuka(void) {
-    sqlite3_open(NAMA_DB, &db);
-    dbExec("CREATE TABLE IF NOT EXISTS app (id INTEGER PRIMARY KEY, jam INTEGER);");
-    dbExec("CREATE TABLE IF NOT EXISTS kendaraan (slot INTEGER PRIMARY KEY, plat TEXT, jenis INTEGER, masuk INTEGER);");
-    dbExec("CREATE TABLE IF NOT EXISTS riwayat (id INTEGER PRIMARY KEY AUTOINCREMENT, plat TEXT, jenis INTEGER, masuk INTEGER, keluar INTEGER, bayar INTEGER);");
-}
-
-void jamMuat(void) {
-    offsetDetik = dbAngka("SELECT jam FROM app WHERE id = 1;", 0);
-    if (offsetDetik == 480) offsetDetik = 0;
-}
-
-void jamSimpan(void) {
-    char sql[64];
-    sprintf(sql, "INSERT OR REPLACE INTO app (id, jam) VALUES (1, %ld);", offsetDetik);
-    dbExec(sql);
-}
-
+/* Berapa slot yang sudah dipakai untuk jenis tertentu */
 int jumlahTerpakai(int jenis) {
-    char sql[64];
-    sprintf(sql, "SELECT COUNT(*) FROM kendaraan WHERE jenis = %d;", jenis);
-    return (int)dbAngka(sql, 0);
+    int n = 0;
+    for (int s = 0; s < TOTAL_SLOT; s++) {
+        if (slotKosong(s) == 0 && jenisParkir[s] == jenis) {
+            n = n + 1;
+        }
+    }
+    return n;
 }
 
-long totalPendapatan(void) {
-    return dbAngka("SELECT COALESCE(SUM(bayar), 0) FROM riwayat;", 0);
-}
-
+/* Cari nomor slot kosong pertama untuk jenis tertentu.
+   Kalau tidak ada, kembalikan -1. */
 int cariSlotKosong(int jenis) {
-    int mulai = (jenis == MOTOR) ? 0 : SLOT_MOTOR;
-    int akhir = (jenis == MOTOR) ? SLOT_MOTOR : TOTAL_SLOT;
-    char sql[64];
+    int mulai, akhir;
+
+    if (jenis == MOBIL) {
+        mulai = SLOT_MOTOR;         /* mobil mulai dari slot 5 */
+        akhir = TOTAL_SLOT;
+    } else {
+        mulai = 0;                  /* motor mulai dari slot 1 */
+        akhir = SLOT_MOTOR;
+    }
+
     for (int s = mulai; s < akhir; s++) {
-        sprintf(sql, "SELECT COUNT(*) FROM kendaraan WHERE slot = %d;", s);
-        if (dbAngka(sql, 0) == 0) return s;
+        if (slotKosong(s) == 1) return s;
+    }
+
+    return -1;
+}
+
+/* Cari nomor slot dari sebuah plat.
+   Kalau plat tidak ada di parkir, kembalikan -1. */
+int cariSlotPlat(const char *plat) {
+    for (int s = 0; s < TOTAL_SLOT; s++) {
+        if (strcmp(platParkir[s], plat) == 0) return s;
     }
     return -1;
 }
 
-int cariSlotPlat(const char *plat) {
-    char sql[128];
-    sprintf(sql, "SELECT slot FROM kendaraan WHERE plat = '%s';", plat);
-    return (int)dbAngka(sql, -1);
+/* Simpan satu transaksi ke riwayat.
+   Kalau riwayat penuh, buang transaksi paling lama. */
+void simpanTransaksi(char *plat, int jenis, int durasi, int bayar) {
+    if (jumlahRiwayat == 50) {
+        /* geser semua data satu posisi ke depan */
+        for (int i = 1; i < 50; i++) {
+            strcpy(platRiwayat[i - 1], platRiwayat[i]);
+            jenisRiwayat[i - 1] = jenisRiwayat[i];
+            durasiRiwayat[i - 1] = durasiRiwayat[i];
+            bayarRiwayat[i - 1] = bayarRiwayat[i];
+        }
+        /* sekarang jumlahRiwayat = 49 */
+        jumlahRiwayat = 49;
+    }
+
+    /* simpan di baris berikutnya */
+    strcpy(platRiwayat[jumlahRiwayat], plat);
+    jenisRiwayat[jumlahRiwayat] = jenis;
+    durasiRiwayat[jumlahRiwayat] = durasi;
+    bayarRiwayat[jumlahRiwayat] = bayar;
+    jumlahRiwayat = jumlahRiwayat + 1;
 }
 
 /* ================================================================
- *  4. MENU DAN FITUR UTAMA
+ *  4. MENU DAN FITUR
  * ================================================================ */
 
 void tampilMenu(void) {
     char waktu[24];
-    fmtWaktu(waktuSekarang(), waktu);
+    tampilWaktu(menitSekarang(), waktu);
 
     printf("\n==============================================\n");
     printf("            SISTEM PARKIR KAMPUS\n");
@@ -164,7 +206,7 @@ void tampilMenu(void) {
     printf(" Jam %s | Motor %d/%d | Mobil %d/%d\n",
            waktu, jumlahTerpakai(MOTOR), SLOT_MOTOR,
            jumlahTerpakai(MOBIL), SLOT_MOBIL);
-    printf(" Total Pendapatan: Rp%ld\n", totalPendapatan());
+    printf(" Total Pendapatan: Rp%ld\n", totalPendapatan);
     printf("----------------------------------------------\n");
     printf(" 1. Kendaraan masuk\n");
     printf(" 2. Kendaraan keluar\n");
@@ -176,152 +218,146 @@ void tampilMenu(void) {
 }
 
 void fiturMasuk(void) {
-    char plat[32], waktu[24], sql[256];
+    char plat[16], waktu[24], jenisTeks[10];
 
+    /* 1. baca plat */
     input("Plat nomor: ", plat, sizeof(plat));
-    rapikanPlat(plat);
-    if (strlen(plat) == 0) {
+    if (plat[0] == 0) {
         puts("  Plat tidak boleh kosong!");
         return;
     }
 
+    /* 2. cek plat sudah ada atau belum */
     if (cariSlotPlat(plat) >= 0) {
         printf("  %s sudah ada di dalam area parkir!\n", plat);
         return;
     }
 
+    /* 3. baca jenis kendaraan */
     int jenis = inputAngka("Jenis (1. Motor, 2. Mobil): ") - 1;
     if (jenis != MOTOR && jenis != MOBIL) {
         puts("  Jenis kendaraan tidak valid!");
         return;
     }
+    namaJenis(jenis, jenisTeks);
 
+    /* 4. cari slot kosong */
     int slot = cariSlotKosong(jenis);
     if (slot < 0) {
-        printf("  Parkir %s penuh!\n", (jenis == MOBIL) ? "Mobil" : "Motor");
+        printf("  Parkir %s penuh!\n", jenisTeks);
         return;
     }
 
-    time_t sekarang = waktuSekarang();
-    sprintf(sql, "INSERT INTO kendaraan VALUES (%d, '%s', %d, %ld);",
-            slot, plat, jenis, (long)sekarang);
-    dbExec(sql);
+    /* 5. isi data ke slot tersebut */
+    strcpy(platParkir[slot], plat);
+    jenisParkir[slot] = jenis;
+    menitMasukParkir[slot] = menitSekarang();
 
-    fmtWaktu(sekarang, waktu);
+    /* 6. kabari ke user */
+    tampilWaktu(menitMasukParkir[slot], waktu);
     printf("  %s masuk slot %d pada %s.\n", plat, slot + 1, waktu);
 }
 
 void fiturKeluar(void) {
-    char plat[32], sql[256], wMasuk[24], wKeluar[24];
+    char plat[16], wMasuk[24], wKeluar[24], jenisTeks[10];
 
+    /* 1. baca plat */
     input("Plat nomor: ", plat, sizeof(plat));
-    rapikanPlat(plat);
 
-    sprintf(sql, "SELECT slot, jenis, masuk FROM kendaraan WHERE plat = '%s';", plat);
-    char **hasil;
-    int baris, kolom;
-    if (sqlite3_get_table(db, sql, &hasil, &baris, &kolom, NULL) != SQLITE_OK || baris == 0) {
-        if (hasil) sqlite3_free_table(hasil);
+    /* 2. cari slotnya */
+    int slot = cariSlotPlat(plat);
+    if (slot < 0) {
         puts("  Kendaraan tidak ditemukan!");
         return;
     }
 
-    int slot     = atoi(hasil[3]);
-    int jenis    = atoi(hasil[4]);
-    time_t masuk = atol(hasil[5]);
-    sqlite3_free_table(hasil);
+    /* 3. hitung durasi (selisih menit keluar - menit masuk) */
+    long keluar = menitSekarang();
+    int durasi  = (int)(keluar - menitMasukParkir[slot]);
+    if (durasi < 0) durasi = 0;
 
-    time_t sekarang  = waktuSekarang();
-    long durasiDetik = sekarang - masuk;
-    if (durasiDetik < 0) durasiDetik = 0;
+    /* 4. hitung tarif */
+    int jenis = jenisParkir[slot];
+    int bayar = hitungTarif(jenis, durasi);
+    namaJenis(jenis, jenisTeks);
 
-    int durasiMenit = durasiDetik / 60;
-    if (durasiDetik > 0 && durasiMenit == 0) durasiMenit = 1;
-
-    int bayar = hitungTarif(jenis, durasiMenit);
-
-    fmtWaktu(masuk, wMasuk);
-    fmtWaktu(sekarang, wKeluar);
+    /* 5. cetak struk */
+    tampilWaktu(menitMasukParkir[slot], wMasuk);
+    tampilWaktu(keluar, wKeluar);
 
     printf("\n  ---------- STRUK PARKIR ----------\n");
     printf("  Plat   : %s\n", plat);
-    printf("  Jenis  : %s\n", (jenis == MOBIL) ? "Mobil" : "Motor");
+    printf("  Jenis  : %s\n", jenisTeks);
     printf("  Masuk  : %s\n", wMasuk);
     printf("  Keluar : %s\n", wKeluar);
-    printf("  Durasi : %d jam %d menit (%ld detik)\n",
-           durasiMenit / 60, durasiMenit % 60, durasiDetik % 60);
+    printf("  Durasi : %d jam %d menit\n", durasi / 60, durasi % 60);
     printf("  Tarif  : Rp%d\n", bayar);
     printf("  ----------------------------------\n");
 
-    sprintf(sql, "INSERT INTO riwayat (plat, jenis, masuk, keluar, bayar) VALUES ('%s', %d, %ld, %ld, %d);",
-            plat, jenis, (long)masuk, (long)sekarang, bayar);
-    dbExec(sql);
+    /* 6. simpan ke riwayat dan tambahkan uang */
+    simpanTransaksi(plat, jenis, durasi, bayar);
+    totalPendapatan = totalPendapatan + bayar;
 
-    sprintf(sql, "DELETE FROM kendaraan WHERE slot = %d;", slot);
-    dbExec(sql);
+    /* 7. kosongkan slotnya */
+    platParkir[slot][0] = 0;
 }
 
 void fiturPetaSlot(void) {
-    char isi[TOTAL_SLOT][32];
-    for (int i = 0; i < TOTAL_SLOT; i++) strcpy(isi[i], "kosong");
-
-    char **hasil;
-    int baris, kolom;
-    if (sqlite3_get_table(db, "SELECT slot, plat FROM kendaraan;", &hasil, &baris, &kolom, NULL) == SQLITE_OK) {
-        for (int i = 1; i <= baris; i++) {
-            int s = atoi(hasil[i * 2]);
-            if (s >= 0 && s < TOTAL_SLOT) strcpy(isi[s], hasil[i * 2 + 1]);
-        }
-        sqlite3_free_table(hasil);
+    puts("\n  Slot Motor:");
+    for (int s = 0; s < SLOT_MOTOR; s++) {
+        if (slotKosong(s) == 1) printf("  [%2d] kosong\n", s + 1);
+        else                   printf("  [%2d] %s\n", s + 1, platParkir[s]);
     }
 
-    puts("\n  Slot Motor:");
-    for (int i = 0; i < SLOT_MOTOR; i++)
-        printf("  [%2d] %-11s\n", i + 1, isi[i]);
-
     puts("\n  Slot Mobil:");
-    for (int i = SLOT_MOTOR; i < TOTAL_SLOT; i++)
-        printf("  [%2d] %-11s\n", i + 1, isi[i]);
+    for (int s = SLOT_MOTOR; s < TOTAL_SLOT; s++) {
+        if (slotKosong(s) == 1) printf("  [%2d] kosong\n", s + 1);
+        else                   printf("  [%2d] %s\n", s + 1, platParkir[s]);
+    }
 }
 
 void fiturRiwayat(void) {
-    char **hasil;
-    int baris, kolom;
-    if (sqlite3_get_table(db, "SELECT plat, jenis, masuk, keluar, bayar FROM riwayat;", &hasil, &baris, &kolom, NULL) != SQLITE_OK || baris == 0) {
+    if (jumlahRiwayat == 0) {
         puts("  Belum ada transaksi.");
-        if (hasil) sqlite3_free_table(hasil);
         return;
     }
 
-    printf("\n  %-3s %-11s %-6s %-18s %-18s %s\n", "No", "Plat", "Jenis", "Masuk", "Keluar", "Bayar");
-    for (int i = 1; i <= baris; i++) {
-        char wMasuk[24], wKeluar[24];
-        fmtWaktu(atol(hasil[i * 5 + 2]), wMasuk);
-        fmtWaktu(atol(hasil[i * 5 + 3]), wKeluar);
+    printf("\n  %-3s %-11s %-6s %-14s %s\n",
+           "No", "Plat", "Jenis", "Durasi", "Bayar");
 
-        printf("  %-3d %-11s %-6s %-18s %-18s Rp%s\n",
-               i,
-               hasil[i * 5 + 0],
-               (atoi(hasil[i * 5 + 1]) == MOBIL) ? "Mobil" : "Motor",
-               wMasuk, wKeluar, hasil[i * 5 + 4]);
+    for (int i = 0; i < jumlahRiwayat; i++) {
+        char jenisTeks[10], durasiTeks[20];
+        namaJenis(jenisRiwayat[i], jenisTeks);
+
+        int jam = durasiRiwayat[i] / 60;
+        int sisa = durasiRiwayat[i] % 60;
+        sprintf(durasiTeks, "%d jam %d mnt", jam, sisa);
+
+        printf("  %-3d %-11s %-6s %-14s Rp%d\n",
+               i + 1, platRiwayat[i], jenisTeks, durasiTeks, bayarRiwayat[i]);
     }
-    sqlite3_free_table(hasil);
 }
 
 void fiturMajukan(void) {
     char waktu[24];
-    printf("  Offset saat ini: +%ld menit.\n", offsetDetik / 60);
-    int m = inputAngka("Majukan berapa menit (0 untuk reset ke waktu nyata): ");
-    if (m == 0) {
-        offsetDetik = 0;
-        puts("  Waktu di-reset kembali ke waktu nyata saat ini.");
+
+    if (offsetMenit == 0) {
+        puts("  Waktu sekarang mengikuti waktu nyata.");
     } else {
-        offsetDetik += (long)m * 60;
+        printf("  Waktu dimajukan +%ld menit dari waktu nyata.\n", offsetMenit);
+    }
+
+    int m = inputAngka("Majukan berapa menit (0 untuk kembali ke waktu nyata): ");
+
+    if (m == 0) {
+        offsetMenit = 0;
+        puts("  Waktu kembali mengikuti waktu nyata.");
+    } else {
+        offsetMenit = offsetMenit + m;
         printf("  Waktu berhasil dimajukan %d menit.\n", m);
     }
-    jamSimpan();
 
-    fmtWaktu(waktuSekarang(), waktu);
+    tampilWaktu(menitSekarang(), waktu);
     printf("  Waktu sekarang menjadi: %s\n", waktu);
 }
 
@@ -331,8 +367,6 @@ void fiturMajukan(void) {
 
 int main(void) {
     int pilihan;
-    dbBuka();
-    jamMuat();
 
     do {
         tampilMenu();
@@ -349,9 +383,8 @@ int main(void) {
         }
 
         if (pilihan != 0) jeda();
+
     } while (pilihan != 0);
 
-    jamSimpan();
-    sqlite3_close(db);
     return 0;
 }
